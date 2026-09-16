@@ -1,0 +1,355 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Drawing;
+using System.IO;
+using System.Linq;
+using System.Globalization;
+using System.Security.Cryptography;
+using System.Text;
+using System.Threading;
+using System.Windows.Forms;
+using System.Web.Script.Serialization;
+using Microsoft.Win32;
+using System.Net.NetworkInformation;
+using System.Reflection;
+using System.Management;
+using Darwin2DicomSync;
+using Darwin2Licensing;
+
+[assembly: AssemblyTitle("Darwin2 Worklist Bridge")]
+[assembly: AssemblyProduct("Darwin2 Worklist Bridge")]
+[assembly: AssemblyVersion("1.4.2.0")]
+[assembly: AssemblyFileVersion("1.4.2.0")]
+
+namespace Darwin2WorklistBridge
+{
+    internal static class Program
+    {
+        [STAThread]
+        private static int Main(string[] args)
+        {
+            string baseDirectory = AppDomain.CurrentDomain.BaseDirectory.TrimEnd(
+                Path.DirectorySeparatorChar,
+                Path.AltDirectorySeparatorChar);
+
+            if (args.Length == 2 && args[0] == "--check-feature")
+            {
+                var status = TrialManager.GetOrCreate();
+                Features wanted = args[1] == "worklist" ? Features.Worklist : args[1] == "pacs" ? Features.Pacs : Features.None;
+                return wanted != Features.None && status.IsValid && !status.IsExpired && (status.Features & wanted) == wanted ? 0 : 23;
+            }
+
+            if (args.Any(a => string.Equals(a, "--self-test", StringComparison.OrdinalIgnoreCase)))
+            {
+                return File.Exists(Path.Combine(baseDirectory, "Start-DarwinWorklistBridge.ps1")) &&
+                       File.Exists(Path.Combine(baseDirectory, "Import-DarwinWorklist.ps1"))
+                    ? 0
+                    : 2;
+            }
+
+            Application.EnableVisualStyles();
+            Application.SetCompatibleTextRenderingDefault(false);
+            Application.Run(new MainForm(baseDirectory));
+            return 0;
+        }
+    }
+
+    internal sealed class TrialStatus
+    {
+        public bool IsValid;
+        public bool IsExpired;
+        public int RemainingDays;
+        public DateTime StartUtc;
+        public DateTime ExpiresUtc;
+        public string Error;
+        public bool IsLicensed;
+        public string MachineCode;
+        public Features Features = Features.Worklist;
+    }
+
+    internal static class TrialManager
+    {
+        private const int TrialDays = 90;
+        private static readonly byte[] Entropy =
+            Encoding.UTF8.GetBytes("Darwin2WorklistBridge.Trial.v1");
+        private static readonly byte[] LicenseEntropy = Encoding.UTF8.GetBytes("Darwin2WorklistBridge.License.v1");
+        private static readonly byte[] ActivationSecret = Encoding.UTF8.GetBytes("D2WB-ACTIVATION-2026-V1-9F4C7A21");
+
+        private static string StatePath
+        {
+            get
+            {
+                return Path.Combine(
+                    AppDomain.CurrentDomain.BaseDirectory,
+                    "runtime",
+                    "trial-v1.dat");
+            }
+        }
+
+        private static string LicensePath { get { return Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "runtime", "license-v1.dat"); } }
+        public static string GetMachineCode()
+        {
+            string[] permanentHardwareAddresses = GetPermanentHardwareMacAddresses();
+            var adapters = NetworkInterface.GetAllNetworkInterfaces()
+                .Where(item => item.NetworkInterfaceType != NetworkInterfaceType.Loopback && item.NetworkInterfaceType != NetworkInterfaceType.Tunnel)
+                .Select(item => new
+                {
+                    Address = item.GetPhysicalAddress().ToString().ToUpperInvariant(),
+                    IsStable = IsStableHardwareAdapter(item),
+                    Priority = item.NetworkInterfaceType == NetworkInterfaceType.Ethernet ? 0 :
+                               item.NetworkInterfaceType == NetworkInterfaceType.Wireless80211 ? 1 : 2
+                })
+                .Where(item => item.Address.Length >= 5)
+                .OrderBy(item => item.Priority)
+                .ThenBy(item => item.Address, StringComparer.Ordinal)
+                .ToArray();
+            if (adapters.Length == 0) throw new InvalidOperationException("找不到可用的網卡 MAC。");
+
+            string licensedCode;
+            if (TryReadLicensedMachineCode(out licensedCode) &&
+                (adapters.Any(item => item.Address.EndsWith(licensedCode, StringComparison.OrdinalIgnoreCase)) ||
+                 permanentHardwareAddresses.Any(address => address.EndsWith(licensedCode, StringComparison.OrdinalIgnoreCase))))
+            {
+                return licensedCode;
+            }
+            if (permanentHardwareAddresses.Length > 0)
+            {
+                string permanent = permanentHardwareAddresses[0];
+                return permanent.Substring(permanent.Length - 5);
+            }
+            var stableAdapters = adapters.Where(item => item.IsStable).ToArray();
+            string selected = (stableAdapters.Length > 0 ? stableAdapters[0] : adapters[0]).Address;
+            return selected.Substring(selected.Length - 5);
+        }
+
+        private static string[] GetPermanentHardwareMacAddresses()
+        {
+            try
+            {
+                var candidates = new List<Tuple<int, string>>();
+                using (var searcher = new ManagementObjectSearcher(
+                    @"root\StandardCimv2",
+                    "SELECT Name, InterfaceDescription, PermanentAddress, HardwareInterface, Virtual FROM MSFT_NetAdapter WHERE HardwareInterface = TRUE"))
+                using (ManagementObjectCollection results = searcher.Get())
+                {
+                    foreach (ManagementBaseObject result in results)
+                    {
+                        if (result["Virtual"] != null && Convert.ToBoolean(result["Virtual"], CultureInfo.InvariantCulture)) continue;
+                        string raw = Convert.ToString(result["PermanentAddress"], CultureInfo.InvariantCulture);
+                        string address = new string((raw ?? string.Empty).Where(Uri.IsHexDigit).ToArray()).ToUpperInvariant();
+                        if (address.Length != 12) continue;
+                        string identity = (Convert.ToString(result["Name"], CultureInfo.InvariantCulture) + " " +
+                                           Convert.ToString(result["InterfaceDescription"], CultureInfo.InvariantCulture)).ToLowerInvariant();
+                        int priority = identity.Contains("ethernet") || identity.Contains("乙太") ? 0 :
+                                       identity.Contains("wi-fi") || identity.Contains("wifi") || identity.Contains("wireless") ? 1 : 2;
+                        candidates.Add(Tuple.Create(priority, address));
+                    }
+                }
+                return candidates.OrderBy(item => item.Item1)
+                                 .ThenBy(item => item.Item2, StringComparer.Ordinal)
+                                 .Select(item => item.Item2)
+                                 .Distinct(StringComparer.OrdinalIgnoreCase)
+                                 .ToArray();
+            }
+            catch
+            {
+                return new string[0];
+            }
+        }
+
+        private static bool IsStableHardwareAdapter(NetworkInterface adapter)
+        {
+            if (adapter.NetworkInterfaceType != NetworkInterfaceType.Ethernet &&
+                adapter.NetworkInterfaceType != NetworkInterfaceType.Wireless80211)
+            {
+                return false;
+            }
+
+            string identity = ((adapter.Name ?? string.Empty) + " " +
+                               (adapter.Description ?? string.Empty)).ToLowerInvariant();
+            string[] excludedKeywords =
+            {
+                "virtual", "vethernet", "hyper-v", "vmware", "virtualbox",
+                "vpn", "tap-windows", "tunnel", "loopback", "pseudo",
+                "bluetooth", "wi-fi direct", "wifi direct", "miniport",
+                "docker", "wsl", "teredo"
+            };
+            return !excludedKeywords.Any(keyword => identity.Contains(keyword));
+        }
+
+        private static bool TryReadLicensedMachineCode(out string machineCode)
+        {
+            machineCode = string.Empty;
+            try
+            {
+                string v2 = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "runtime", "license-v2.dat");
+                if (File.Exists(v2))
+                {
+                    string[] v = File.ReadAllText(v2, Encoding.UTF8).Trim().Split('|');
+                    if (v.Length == 2 && FeatureLicense.Verify(v[0], v[1]) != Features.None) { machineCode = v[0]; return true; }
+                }
+                if (!File.Exists(LicensePath)) return false;
+                string value = ReadLicenseText();
+                string[] parts = value.Split('|');
+                if (parts.Length != 2 || parts[0].Length != 5 || parts[0].Any(character => !Uri.IsHexDigit(character))) return false;
+                string normalized = parts[0].ToUpperInvariant();
+                if (!CryptographicEquals(parts[1], CalculateActivationCode(normalized).Replace("-", string.Empty))) return false;
+                machineCode = normalized;
+                return true;
+            }
+            catch { return false; }
+        }
+
+        public static string CalculateActivationCode(string machineCode)
+        {
+            string normalized = new string((machineCode ?? string.Empty).Where(Uri.IsHexDigit).ToArray()).ToUpperInvariant();
+            if (normalized.Length != 5) throw new ArgumentException("機器碼必須是 5 個十六進位字元。");
+            using (var hmac = new HMACSHA256(ActivationSecret))
+            {
+                string hex = BitConverter.ToString(hmac.ComputeHash(Encoding.ASCII.GetBytes("DARWIN2|" + normalized))).Replace("-", string.Empty).Substring(0, 20);
+                return string.Join("-", Enumerable.Range(0, 5).Select(index => hex.Substring(index * 4, 4)).ToArray());
+            }
+        }
+
+        public static void InstallLicense(string activationCode)
+        {
+            string machine = GetMachineCode();
+            string featurePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "runtime", "license-v2.dat");
+            if ((activationCode ?? "").Trim().StartsWith("D2-", StringComparison.OrdinalIgnoreCase))
+            {
+                if (FeatureLicense.Verify(machine, activationCode) == Features.None) throw new InvalidOperationException("功能啟動碼無效或不屬於此電腦。");
+                Directory.CreateDirectory(Path.GetDirectoryName(featurePath));
+                File.WriteAllText(featurePath, machine + "|" + activationCode.Trim().ToUpperInvariant(), new UTF8Encoding(false));
+                return;
+            }
+            string normalized = (activationCode ?? string.Empty).Replace("-", string.Empty).Replace(" ", string.Empty).ToUpperInvariant();
+            string expected = CalculateActivationCode(machine).Replace("-", string.Empty);
+            if (!CryptographicEquals(normalized, expected)) throw new InvalidOperationException("啟動碼不正確。");
+            Directory.CreateDirectory(Path.GetDirectoryName(LicensePath));
+            File.WriteAllText(LicensePath, machine + "|" + expected, new UTF8Encoding(false));
+            if (File.Exists(featurePath)) File.Delete(featurePath);
+        }
+
+        private static string ReadLicenseText()
+        {
+            byte[] raw = File.ReadAllBytes(LicensePath);
+            string plain = Encoding.UTF8.GetString(raw);
+            if (plain.Contains("|")) return plain.Trim();
+            try { return Encoding.UTF8.GetString(ProtectedData.Unprotect(raw, LicenseEntropy, DataProtectionScope.CurrentUser)); }
+            catch (CryptographicException) { return Encoding.UTF8.GetString(ProtectedData.Unprotect(raw, LicenseEntropy, DataProtectionScope.LocalMachine)); }
+        }
+
+        private static bool HasValidLicense(string machine)
+        {
+            if (!File.Exists(LicensePath)) return false;
+            try
+            {
+                string value = ReadLicenseText();
+                string[] parts = value.Split('|');
+                return parts.Length == 2 && parts[0] == machine && CryptographicEquals(parts[1], CalculateActivationCode(machine).Replace("-", string.Empty));
+            }
+            catch { return false; }
+        }
+
+        private static bool TryMigrateLegacyLicense(string machine)
+        {
+            try
+            {
+                if (!File.Exists(LicensePath) || !File.Exists(StatePath)) return false;
+                if (!GetPermanentHardwareMacAddresses().Any(address => address.EndsWith(machine, StringComparison.OrdinalIgnoreCase))) return false;
+
+                string[] licenseParts = ReadLicenseText().Split('|');
+                if (licenseParts.Length != 2) return false;
+                string legacyMachine = licenseParts[0].ToUpperInvariant();
+                if (legacyMachine.Length != 5 || legacyMachine.Any(character => !Uri.IsHexDigit(character))) return false;
+                string legacyExpected = CalculateActivationCode(legacyMachine).Replace("-", string.Empty);
+                if (!CryptographicEquals(licenseParts[1], legacyExpected)) return false;
+
+                byte[] stateBytes = ProtectedData.Unprotect(
+                    File.ReadAllBytes(StatePath),
+                    Entropy,
+                    DataProtectionScope.CurrentUser);
+                string[] stateParts = Encoding.UTF8.GetString(stateBytes).Split('|');
+                if (stateParts.Length != 2) return false;
+                DateTime startUtc = new DateTime(long.Parse(stateParts[0], CultureInfo.InvariantCulture), DateTimeKind.Utc);
+                DateTime lastSeenUtc = new DateTime(long.Parse(stateParts[1], CultureInfo.InvariantCulture), DateTimeKind.Utc);
+                DateTime nowUtc = DateTime.UtcNow;
+                if (startUtc > nowUtc.AddDays(1) || lastSeenUtc < startUtc || lastSeenUtc > nowUtc.AddDays(1)) return false;
+
+                string backup = Path.Combine(
+                    Path.GetDirectoryName(LicensePath),
+                    "license-v1.legacy-" + legacyMachine + ".dat");
+                if (!File.Exists(backup)) File.Copy(LicensePath, backup, false);
+                string migratedExpected = CalculateActivationCode(machine).Replace("-", string.Empty);
+                File.WriteAllText(LicensePath, machine + "|" + migratedExpected, new UTF8Encoding(false));
+                return HasValidLicense(machine);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static bool CryptographicEquals(string left, string right)
+        {
+            if (left == null || right == null || left.Length != right.Length) return false;
+            int diff = 0; for (int i = 0; i < left.Length; i++) diff |= left[i] ^ right[i]; return diff == 0;
+        }
+
+        public static TrialStatus GetOrCreate()
+        {
+            DateTime nowUtc = DateTime.UtcNow;
+            try
+            {
+                string machineCode = GetMachineCode();
+                string featurePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "runtime", "license-v2.dat");
+                if (File.Exists(featurePath))
+                {
+                    string[] v = File.ReadAllText(featurePath, Encoding.UTF8).Trim().Split('|');
+                    Features granted = v.Length == 2 && v[0] == machineCode ? FeatureLicense.Verify(machineCode, v[1]) : Features.None;
+                    return new TrialStatus { IsValid = granted != Features.None, IsExpired = granted == Features.None, IsLicensed = granted != Features.None, Features = granted, MachineCode = machineCode, RemainingDays = granted == Features.None ? 0 : int.MaxValue, Error = granted == Features.None ? "功能授權無效" : "" };
+                }
+                if (HasValidLicense(machineCode) || TryMigrateLegacyLicense(machineCode))
+                {
+                    return new TrialStatus { IsValid = true, IsExpired = false, IsLicensed = true, RemainingDays = int.MaxValue, MachineCode = machineCode, Error = string.Empty };
+                }
+                DateTime startUtc;
+                DateTime lastSeenUtc;
+                if (File.Exists(StatePath))
+                {
+                    byte[] protectedBytes = File.ReadAllBytes(StatePath);
+                    byte[] plainBytes = ProtectedData.Unprotect(
+                        protectedBytes,
+                        Entropy,
+                        DataProtectionScope.CurrentUser);
+                    string[] parts = Encoding.UTF8.GetString(plainBytes).Split('|');
+                    if (parts.Length != 2)
+                    {
+                        throw new InvalidDataException("Trial state format is invalid.");
+                    }
+                    long startTicks = long.Parse(parts[0], CultureInfo.InvariantCulture);
+                    long lastSeenTicks = long.Parse(parts[1], CultureInfo.InvariantCulture);
+                    startUtc = new DateTime(startTicks, DateTimeKind.Utc);
+                    lastSeenUtc = new DateTime(lastSeenTicks, DateTimeKind.Utc);
+                }
+                else
+                {
+                    startUtc = nowUtc;
+                    lastSeenUtc = nowUtc;
+                }
+
+                if (startUtc > nowUtc.AddDays(1) || lastSeenUtc < startUtc)
+                {
+                    throw new InvalidDataException("Trial state time is invalid.");
+                }
+
+                DateTime effectiveNow = nowUtc < lastSeenUtc ? lastSeenUtc : nowUtc;
+                DateTime expiresUtc = startUtc.AddDays(TrialDays);
+                bool expired = effectiveNow >= expiresUtc;
+                int remaining = expired
+                    ? 0
+                    : (int)Math.Ceiling((expiresUtc - effectiveNow).TotalDays);
+
+                string directory = Path.GetDirectoryName(StatePath);
+                Directory.CreateDirectory(directory);
