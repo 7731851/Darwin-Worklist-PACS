@@ -1,0 +1,625 @@
+          string stateText = startUtc.Ticks.ToString(CultureInfo.InvariantCulture) +
+                                   "|" +
+                                   effectiveNow.Ticks.ToString(CultureInfo.InvariantCulture);
+                byte[] encrypted = ProtectedData.Protect(
+                    Encoding.UTF8.GetBytes(stateText),
+                    Entropy,
+                    DataProtectionScope.CurrentUser);
+                File.WriteAllBytes(StatePath, encrypted);
+
+                return new TrialStatus
+                {
+                    IsValid = true,
+                    IsExpired = expired,
+                    RemainingDays = remaining,
+                    StartUtc = startUtc,
+                    ExpiresUtc = expiresUtc,
+                    Error = string.Empty
+                    ,MachineCode = machineCode
+                };
+            }
+            catch (Exception ex)
+            {
+                return new TrialStatus
+                {
+                    IsValid = false,
+                    IsExpired = true,
+                    RemainingDays = 0,
+                    Error = ex.Message
+                };
+            }
+        }
+    }
+
+    internal sealed class MainForm : Form
+    {
+        private readonly string baseDirectory;
+        private readonly string inboxDirectory;
+        private readonly string archiveDirectory;
+        private readonly string errorDirectory;
+        private readonly string logPath;
+        private readonly string lockPath;
+        private readonly Label statusLabel;
+        private readonly Label trialLabel;
+        private readonly Label footerLabel;
+        private readonly Button licenseButton;
+        private readonly Label lastActivityLabel;
+        private readonly TextBox logTextBox;
+        private readonly Panel dropPanel;
+        private readonly System.Windows.Forms.Timer refreshTimer;
+        private TrialStatus trial;
+        private DateTime nextTrialRefreshUtc;
+        private PacsController pacs;
+        private Label featureSummary;
+        private Control[] worklistControls;
+
+        public MainForm(string baseDirectory)
+        {
+            Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
+            this.baseDirectory = baseDirectory;
+            inboxDirectory = Path.Combine(baseDirectory, "inbox");
+            archiveDirectory = Path.Combine(baseDirectory, "archive");
+            errorDirectory = Path.Combine(baseDirectory, "error");
+            logPath = Path.Combine(baseDirectory, "logs", "bridge.log");
+            lockPath = Path.Combine(inboxDirectory, ".darwin2-worklist-bridge.lock");
+
+            Directory.CreateDirectory(inboxDirectory);
+            Directory.CreateDirectory(archiveDirectory);
+            Directory.CreateDirectory(errorDirectory);
+            Directory.CreateDirectory(Path.GetDirectoryName(logPath));
+            Directory.CreateDirectory(Path.Combine(baseDirectory, "runtime"));
+
+            trial = TrialManager.GetOrCreate();
+            pacs = new PacsController(baseDirectory);
+            nextTrialRefreshUtc = DateTime.UtcNow.AddMinutes(10);
+
+            Text = "Darwin2 Worklist 橋接程式 1.4.2（90 天試用版）";
+            StartPosition = FormStartPosition.CenterScreen;
+            ClientSize = new Size(820, 590);
+            MinimumSize = new Size(600, 420);
+            AutoScaleDimensions = new SizeF(96, 96);
+            AutoScaleMode = AutoScaleMode.Dpi;
+            Font = new Font("Microsoft JhengHei UI", 10F, FontStyle.Regular, GraphicsUnit.Point);
+            BackColor = Color.FromArgb(244, 247, 250);
+            AllowDrop = true;
+
+            var title = new Label
+            {
+                Text = "Darwin2 Worklist 橋接程式 1.4.2",
+                Font = new Font(Font.FontFamily, 21F, FontStyle.Bold),
+                ForeColor = Color.FromArgb(27, 54, 83),
+                AutoSize = true,
+                Location = new Point(28, 22)
+            };
+            Controls.Add(title);
+
+            var subtitle = new Label
+            {
+                Text = "正式介接：DICOM Modality Worklist｜手動測試：CSV / JSON",
+                ForeColor = Color.FromArgb(76, 91, 108),
+                AutoSize = true,
+                Location = new Point(31, 67)
+            };
+            Controls.Add(subtitle);
+
+            statusLabel = new Label
+            {
+                Text = "● 檢查中",
+                Font = new Font(Font.FontFamily, 11F, FontStyle.Bold),
+                AutoSize = true,
+                Location = new Point(650, 32)
+            };
+            Controls.Add(statusLabel);
+
+            trialLabel = new Label
+            {
+                AutoSize = true,
+                Location = new Point(618, 61),
+                ForeColor = Color.FromArgb(76, 91, 108)
+            };
+            Controls.Add(trialLabel);
+
+            dropPanel = new Panel
+            {
+                Location = new Point(28, 105),
+                Size = new Size(764, 150),
+                BackColor = Color.White,
+                BorderStyle = BorderStyle.FixedSingle,
+                AllowDrop = true,
+                Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right
+            };
+            var dropTitle = new Label
+            {
+                Text = "手動測試區：將 CSV / JSON 拖曳到這裡",
+                Font = new Font(Font.FontFamily, 17F, FontStyle.Bold),
+                ForeColor = Color.FromArgb(34, 104, 156),
+                AutoSize = true,
+                Location = new Point(215, 35)
+            };
+            var dropHelp = new Label
+            {
+                Text = "用於測試 Mapping 與 Darwin2 寫入；正式資料由 DICOM MWL 自動查詢",
+                ForeColor = Color.FromArgb(96, 108, 120),
+                AutoSize = true,
+                Location = new Point(225, 82)
+            };
+            dropPanel.Controls.Add(dropTitle);
+            dropPanel.Controls.Add(dropHelp);
+            Controls.Add(dropPanel);
+
+            string initialSearchTag = "0010,0020";
+            try
+            {
+                var savedRoot = new JavaScriptSerializer().DeserializeObject(File.ReadAllText(Path.Combine(baseDirectory, "config", "hospital-interface.json"), Encoding.UTF8)) as Dictionary<string, object>;
+                var savedDicom = savedRoot == null ? null : savedRoot["dicomMwl"] as Dictionary<string, object>;
+                object savedValue;
+                if (savedDicom != null && savedDicom.TryGetValue("searchIdTag", out savedValue) && !string.IsNullOrWhiteSpace(Convert.ToString(savedValue))) initialSearchTag = Convert.ToString(savedValue);
+            }
+            catch { }
+            var searchPanel = new TableLayoutPanel { Dock = DockStyle.Top, Height = 96, ColumnCount = 5, RowCount = 2, Padding = new Padding(8), BackColor = Color.White };
+            searchPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize)); searchPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 220)); searchPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize)); searchPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100)); searchPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 150));
+            searchPanel.RowStyles.Add(new RowStyle(SizeType.Percent, 50)); searchPanel.RowStyles.Add(new RowStyle(SizeType.Percent, 50));
+            var searchTagBox = new TextBox { Text = initialSearchTag, Dock = DockStyle.Fill, ReadOnly = true, BackColor = Color.FromArgb(235, 239, 243) };
+            var searchTagPanel = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 1, Margin = new Padding(0) };
+            searchTagPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent,100)); searchTagPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute,36));
+            var searchTagLockButton = new Button { Text = "", Dock = DockStyle.Right, Width = 42, FlatStyle = FlatStyle.Flat, AccessibleName = "搜尋 Tag 鎖定" };
+            searchTagBox.Dock = DockStyle.Fill; searchTagBox.Margin = new Padding(0,0,4,0); searchTagLockButton.Dock = DockStyle.Fill; searchTagLockButton.Margin = new Padding(0);
+            searchTagPanel.Controls.Add(searchTagBox,0,0); searchTagPanel.Controls.Add(searchTagLockButton,1,0);
+            LockArtwork.Set(searchTagLockButton, true);
+            var searchIdBox = new TextBox { Name = "searchIdBox", Dock = DockStyle.Fill, ImeMode = ImeMode.Disable };
+            string lastValidId = ""; bool restoringId = false;
+            searchIdBox.Enter += (sender,e) => { searchIdBox.ImeMode = ImeMode.Disable; foreach(InputLanguage language in InputLanguage.InstalledInputLanguages) if(language.Culture.TwoLetterISOLanguageName == "en") { InputLanguage.CurrentInputLanguage = language; break; } };
+            searchIdBox.KeyPress += (sender,e) => { if(!Char.IsControl(e.KeyChar) && !((e.KeyChar>='0'&&e.KeyChar<='9')||(e.KeyChar>='A'&&e.KeyChar<='Z')||(e.KeyChar>='a'&&e.KeyChar<='z'))) e.Handled=true; };
+            searchIdBox.TextChanged += (sender,e) => { if(restoringId)return; if(System.Text.RegularExpressions.Regex.IsMatch(searchIdBox.Text,"^[A-Za-z0-9]*$"))lastValidId=searchIdBox.Text; else { restoringId=true; searchIdBox.Text=lastValidId; searchIdBox.SelectionStart=searchIdBox.TextLength; restoringId=false; } };
+            var searchButton = new Button { Text = "搜尋並抓取", Dock = DockStyle.Fill, BackColor = Color.FromArgb(0,112,192), ForeColor = Color.White, FlatStyle = FlatStyle.Flat };
+            var updateButton = new Button { Text = "更新 Worklist", Dock = DockStyle.Fill, BackColor = Color.FromArgb(27,135,77), ForeColor = Color.White, FlatStyle = FlatStyle.Flat };
+            searchPanel.Controls.Add(new Label { Text = "搜尋 ID Tag", AutoSize = true, Anchor = AnchorStyles.Left },0,0); searchPanel.Controls.Add(searchTagPanel,1,0); searchPanel.SetColumnSpan(searchTagPanel,3);
+            searchPanel.Controls.Add(new Label { Text = "病歷號／ID", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(12,0,6,0) },0,1); searchPanel.Controls.Add(searchIdBox,1,1); searchPanel.SetColumnSpan(searchIdBox,3); searchPanel.Controls.Add(searchButton,4,1);
+            var searchHint = new Label { Text = "點選鎖頭並輸入密碼可修改 Tag。更新 Worklist 會取得日期範圍內全部資料。", AutoSize = true, Anchor = AnchorStyles.Left, ForeColor = Color.FromArgb(90,104,118) };
+            searchPanel.Controls.Add(updateButton,4,0);
+            searchTagLockButton.Click += (s,e) =>
+            {
+                if (searchTagBox.ReadOnly)
+                {
+                    if (!PasswordPromptForm.Verify(this, "解鎖搜尋 Tag", "請輸入解鎖密碼", "admin")) return;
+                    searchTagBox.ReadOnly = false; searchTagBox.BackColor = Color.White; LockArtwork.Set(searchTagLockButton, false); searchTagLockButton.AccessibleName = "搜尋 Tag 已解鎖";
+                }
+                else { searchTagBox.ReadOnly = true; searchTagBox.BackColor = Color.FromArgb(235,239,243); LockArtwork.Set(searchTagLockButton, true); searchTagLockButton.AccessibleName = "搜尋 Tag 鎖定"; }
+            };
+            searchButton.Click += (s,e) => { if (string.IsNullOrWhiteSpace(searchIdBox.Text)) SearchResultForm.Display(this, "請先輸入病歷號／ID；若要取得全部資料請按「更新 Worklist」。", "搜尋結果"); else SearchWorklist(searchTagBox.Text, searchIdBox.Text); };
+            updateButton.Click += (s,e) => SearchWorklist(searchTagBox.Text, "");
+            searchIdBox.KeyDown += (sender,e) => { if(e.KeyCode==Keys.Enter) { e.Handled=true;e.SuppressKeyPress=true;searchButton.PerformClick(); } };
+
+            var chooseButton = NewButton("選擇測試檔", 28, 274, 140);
+            chooseButton.Click += ChooseButton_Click;
+            Controls.Add(chooseButton);
+
+            var openInboxButton = NewButton("測試放檔區", 178, 274, 140);
+            openInboxButton.Click += (s, e) => OpenDirectory(inboxDirectory);
+            Controls.Add(openInboxButton);
+
+            var openArchiveButton = NewButton("測試已完成", 328, 274, 140);
+            openArchiveButton.Click += (s, e) => OpenDirectory(archiveDirectory);
+            Controls.Add(openArchiveButton);
+            var receivedButton = NewButton("Received List", 28, 312, 140);
+            receivedButton.Click += (s, e) => { using (var dialog = new ReceivedListForm(Path.Combine(baseDirectory, "dicom", "archive"))) dialog.ShowDialog(this); };
+            Controls.Add(receivedButton);
+
+            var openErrorButton = NewButton("測試失敗", 478, 274, 140);
+            openErrorButton.Click += (s, e) => OpenDirectory(errorDirectory);
+            Controls.Add(openErrorButton);
+
+            var startButton = NewButton("啟動", 646, 274, 66);
+            startButton.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+            startButton.Click += (s, e) => StartBridge(true);
+            Controls.Add(startButton);
+
+            var stopButton = NewButton("停止", 722, 274, 66);
+            stopButton.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+            stopButton.Click += (s, e) => StopBridge(true);
+            Controls.Add(stopButton);
+
+            lastActivityLabel = new Label
+            {
+                Text = "最近紀錄",
+                Font = new Font(Font.FontFamily, 10F, FontStyle.Bold),
+                AutoSize = true,
+                Location = new Point(29, 365)
+            };
+            Controls.Add(lastActivityLabel);
+
+            logTextBox = new TextBox
+            {
+                Location = new Point(28, 394),
+                Size = new Size(764, 134),
+                Multiline = true,
+                ReadOnly = true,
+                ScrollBars = ScrollBars.Vertical,
+                BackColor = Color.White,
+                Font = new Font("Consolas", 9.5F),
+                Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right
+            };
+            Controls.Add(logTextBox);
+
+            footerLabel = new Label
+            {
+                Text = "版本 1.4.2｜DICOM MWL SCU｜Darwin2 V2.11.1",
+                ForeColor = Color.FromArgb(112, 124, 136),
+                AutoSize = true,
+                Location = new Point(29, 551),
+                Anchor = AnchorStyles.Bottom | AnchorStyles.Left
+            };
+            Controls.Add(footerLabel);
+
+            licenseButton = NewButton("授權解鎖", 505, 539, 135);
+            licenseButton.Anchor = AnchorStyles.Bottom | AnchorStyles.Right;
+            licenseButton.Click += (s, e) =>
+            {
+                using (var dialog = new LicenseForm()) dialog.ShowDialog(this);
+                trial = TrialManager.GetOrCreate();
+                if ((trial.Features & Features.Worklist) == 0 || !trial.IsValid || trial.IsExpired)
+                {
+                    try { DicomMwlSettingsForm.StopClient(baseDirectory); var oldBridge=GetBridgeProcess(true); if(oldBridge!=null) {oldBridge.Kill();oldBridge.WaitForExit(5000);} } catch {}
+                }
+                UpdateTrialDisplay();
+                ApplyFeatureControls();
+                if (trial.IsValid && !trial.IsExpired) StartBridge(false);
+            };
+            Controls.Add(licenseButton);
+
+            var dicomSettingsButton = NewButton("DICOM MWL 設定", 650, 539, 140);
+            dicomSettingsButton.Anchor = AnchorStyles.Bottom | AnchorStyles.Right;
+            dicomSettingsButton.Click += (s, e) =>
+            {
+                string path = Path.Combine(baseDirectory, "config", "hospital-interface.json");
+                using (var dialog = new DicomMwlSettingsForm(path))
+                {
+                    dialog.ShowDialog(this);
+                }
+            };
+            Controls.Add(dicomSettingsButton);
+
+            // PACS report settings belong with the fixed bottom action buttons.
+            var pacsButton = new Button { Text = "PACS 報告設定／紀錄", AutoSize = true, Height = 34 };
+            pacsButton.Click += (s,e) => { using (var f = new PacsSettingsForm(baseDirectory, pacs)) f.ShowDialog(this); };
+
+            // Fixed actions are outside the scrolling content, including file actions.
+            Controls.Clear();
+            var layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 3, Padding = new Padding(16) };
+            layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            var heading = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, FlowDirection = FlowDirection.TopDown, WrapContents = false };
+            title.Font = new Font(Font.FontFamily, 17F, FontStyle.Bold);
+            foreach (Control control in new Control[] { title, subtitle, statusLabel, trialLabel }) { control.Anchor = AnchorStyles.Left; heading.Controls.Add(control); }
+            var content = new Panel { Dock = DockStyle.Fill, AutoScroll = true };
+            var contents = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = true, ColumnCount = 1 };
+            contents.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            dropPanel.Dock = DockStyle.Top; dropPanel.Height = 100;
+            dropTitle.Location = new Point(12, 14); dropTitle.Font = new Font(Font.FontFamily, 12F, FontStyle.Bold);
+            dropHelp.Location = new Point(12, 47); dropHelp.AutoSize = false; dropHelp.Size = new Size(510, 42);
+            dropHelp.Anchor = AnchorStyles.Left | AnchorStyles.Top | AnchorStyles.Right;
+            logTextBox.Dock = DockStyle.Top; logTextBox.Height = 180;
+            contents.Controls.Add(dropPanel); contents.Controls.Add(lastActivityLabel); contents.Controls.Add(logTextBox); content.Controls.Add(contents);
+            var actions = new TableLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, ColumnCount = 4, RowCount = 4 };
+            for (int i = 0; i < 4; i++) actions.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 25));
+            Control[] buttons = { startButton, stopButton, dicomSettingsButton, licenseButton, chooseButton, openInboxButton, openArchiveButton, openErrorButton, receivedButton, pacsButton };
+            for (int i = 0; i < buttons.Length; i++) { buttons[i].Dock = DockStyle.Fill; buttons[i].Margin = new Padding(4); actions.Controls.Add(buttons[i], i % 4, i / 4); }
+            layout.Controls.Add(heading, 0, 0); layout.Controls.Add(content, 0, 1); layout.Controls.Add(actions, 0, 2); Controls.Add(layout);
+            content.Controls.Add(searchPanel); searchPanel.BringToFront();
+            featureSummary = new Label { AutoSize=true, Margin=new Padding(4), ForeColor=Color.FromArgb(72,84,96) };
+            heading.Controls.Add(featureSummary);
+            worklistControls = new Control[] { startButton, stopButton, dicomSettingsButton, chooseButton, openInboxButton, openArchiveButton, openErrorButton, receivedButton, searchPanel };
+
+            DragEnter += HandleDragEnter;
+            DragDrop += HandleDragDrop;
+            dropPanel.DragEnter += HandleDragEnter;
+            dropPanel.DragDrop += HandleDragDrop;
+
+            refreshTimer = new System.Windows.Forms.Timer { Interval = 1500 };
+            refreshTimer.Tick += (s, e) => RefreshStatus();
+            refreshTimer.Start();
+
+            FormClosed += (s, e) => StopBridge(false);
+            Shown += (s, e) =>
+            {
+                UpdateTrialDisplay();
+                ApplyFeatureControls();
+                RefreshStatus();
+                if (trial.IsValid && !trial.IsExpired && (trial.Features & Features.Worklist) != 0) StartBridge(false);
+            };
+        }
+
+        private Button NewButton(string text, int x, int y, int width)
+        {
+            return new Button
+            {
+                Text = text,
+                Location = new Point(x, y),
+                Size = new Size(width, 34),
+                FlatStyle = FlatStyle.Flat,
+                BackColor = Color.White,
+                ForeColor = Color.FromArgb(36, 52, 68)
+            };
+        }
+
+        private void UpdateTrialDisplay()
+        {
+            if (trial == null || !trial.IsValid)
+            {
+                trialLabel.Text = "試用狀態：無法讀取（" + (trial == null ? "未知錯誤" : trial.Error) + "）";
+                trialLabel.ForeColor = Color.FromArgb(173, 42, 42);
+                licenseButton.Enabled = true;
+                return;
+            }
+            if (trial.IsLicensed)
+            {
+                trialLabel.Text = "授權：正式版";
+                trialLabel.ForeColor = Color.FromArgb(35, 128, 83);
+                licenseButton.Enabled = true;
+                return;
+            }
+
+            trialLabel.Text = trial.IsExpired
+                ? "試用狀態：已到期"
+                : "試用狀態：剩餘 " + trial.RemainingDays.ToString() + " 天";
+            trialLabel.ForeColor = trial.IsExpired
+                ? Color.FromArgb(173, 42, 42)
+                : Color.FromArgb(76, 91, 108);
+            licenseButton.Enabled = true;
+        }
+
+        private void ApplyFeatureControls()
+        {
+            Features features = (trial != null && trial.IsValid && !trial.IsExpired) ? trial.Features : Features.None;
+            bool hasWorklist = (features & Features.Worklist) != 0;
+            bool hasPacs = (features & Features.Pacs) != 0;
+            if (worklistControls != null) foreach (Control c in worklistControls) if (c != null) c.Enabled = hasWorklist;
+            if (featureSummary != null) featureSummary.Text = "授權：" + FeatureLicense.Describe(features);
+        }
+
+        private void StartBridge(bool showMessages)
+        {
+            if (trial == null || !trial.IsValid || trial.IsExpired || (trial.Features & Features.Worklist) == 0)
+            {
+                if (showMessages) MessageBox.Show("Worklist 功能未授權或試用已到期。", "授權", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            try
+            {
+                var scriptPath = Path.Combine(baseDirectory, "Start-DarwinWorklistBridge.ps1");
+                if (!File.Exists(scriptPath))
+                {
+                    throw new FileNotFoundException("找不到 Start-DarwinWorklistBridge.ps1", scriptPath);
+                }
+                RunPowerShellScript(scriptPath, true);
+                TryStartDicomClient();
+                if (showMessages) MessageBox.Show("Darwin2 Worklist 橋接程式已啟動。", "完成", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            catch (Exception ex)
+            {
+                if (showMessages) MessageBox.Show(ex.Message, "啟動失敗", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+            RefreshStatus();
+        }
+
+        private void StopBridge(bool showMessages)
+        {
+            try
+            {
+                DicomMwlSettingsForm.StopClient(baseDirectory);
+                Process bridgeProcess = GetBridgeProcess(true);
+                if (bridgeProcess != null)
+                {
+                    bridgeProcess.Kill();
+                    bridgeProcess.WaitForExit(5000);
+                }
+                if (File.Exists(lockPath)) File.Delete(lockPath);
+                if (showMessages) MessageBox.Show("Darwin2 Worklist 橋接程式已停止。", "完成", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            catch (Exception ex)
+            {
+                if (showMessages) MessageBox.Show(ex.Message, "停止失敗", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+            RefreshStatus();
+        }
+
+        private void TryStartDicomClient()
+        {
+            string scriptPath = Path.Combine(baseDirectory, "Start-DicomMwlClient.ps1");
+            if (!File.Exists(scriptPath)) return;
+
+            string configPath = Path.Combine(baseDirectory, "config", "hospital-interface.json");
+            if (!File.Exists(configPath)) return;
+            try
+            {
+                var root = new JavaScriptSerializer().DeserializeObject(File.ReadAllText(configPath, Encoding.UTF8)) as Dictionary<string, object>;
+                var dicom = root == null ? null : root["dicomMwl"] as Dictionary<string, object>;
+                object enabledValue;
+                bool enabled = dicom != null && dicom.TryGetValue("enabled", out enabledValue) && Convert.ToBoolean(enabledValue);
+                if (enabled)
+                {
+                    DicomMwlSettingsForm.StartClient(baseDirectory);
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        private Process GetBridgeProcess(bool requireRunning)
+        {
+            foreach (Process process in Process.GetProcessesByName("powershell"))
+            {
+                try
+                {
+                    using (var searcher = new ManagementObjectSearcher("SELECT CommandLine FROM Win32_Process WHERE ProcessId=" + process.Id))
+                    {
+                        foreach (ManagementObject obj in searcher.Get())
+                        {
+                            string cmd = Convert.ToString(obj["CommandLine"]);
+                            if (cmd.IndexOf("Start-DarwinWorklistBridge.ps1", StringComparison.OrdinalIgnoreCase) >= 0) return process;
+                        }
+                    }
+                }
+                catch { }
+            }
+            return null;
+        }
+
+        private void RefreshStatus()
+        {
+            bool running = GetBridgeProcess(true) != null;
+            statusLabel.Text = running ? "● 執行中" : "● 已停止";
+            statusLabel.ForeColor = running ? Color.FromArgb(35,128,83) : Color.FromArgb(173,42,42);
+            if (DateTime.UtcNow >= nextTrialRefreshUtc)
+            {
+                trial = TrialManager.GetOrCreate();
+                nextTrialRefreshUtc = DateTime.UtcNow.AddMinutes(10);
+                UpdateTrialDisplay();
+                ApplyFeatureControls();
+            }
+            RefreshLog();
+        }
+
+        private void RefreshLog()
+        {
+            try
+            {
+                if (!File.Exists(logPath)) { logTextBox.Text = "尚無紀錄。"; return; }
+                string[] lines = File.ReadAllLines(logPath, Encoding.UTF8);
+                logTextBox.Lines = lines.Skip(Math.Max(0, lines.Length - 80)).ToArray();
+                logTextBox.SelectionStart = logTextBox.TextLength;
+                logTextBox.ScrollToCaret();
+            }
+            catch { }
+        }
+
+        private void HandleDragEnter(object sender, DragEventArgs e)
+        {
+            e.Effect = e.Data.GetDataPresent(DataFormats.FileDrop) ? DragDropEffects.Copy : DragDropEffects.None;
+        }
+
+        private void HandleDragDrop(object sender, DragEventArgs e)
+        {
+            string[] files = e.Data.GetData(DataFormats.FileDrop) as string[];
+            if (files == null) return;
+            foreach (string file in files) ImportTestFile(file);
+        }
+
+        private void ChooseButton_Click(object sender, EventArgs e)
+        {
+            using (var dialog = new OpenFileDialog { Filter = "CSV / JSON|*.csv;*.json|All files|*.*", Multiselect = true })
+            {
+                if (dialog.ShowDialog(this) == DialogResult.OK)
+                {
+                    foreach (string file in dialog.FileNames) ImportTestFile(file);
+                }
+            }
+        }
+
+        private void ImportTestFile(string sourcePath)
+        {
+            try
+            {
+                if (!File.Exists(sourcePath)) return;
+                string extension = Path.GetExtension(sourcePath).ToLowerInvariant();
+                if (extension != ".csv" && extension != ".json")
+                {
+                    throw new InvalidDataException("只接受 CSV 或 JSON 測試檔。" );
+                }
+                string destination = Path.Combine(inboxDirectory, Path.GetFileName(sourcePath));
+                File.Copy(sourcePath, destination, true);
+                lastActivityLabel.Text = "已放入測試檔：" + Path.GetFileName(sourcePath);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(ex.Message, "匯入失敗", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        private void SearchWorklist(string tag, string patientId)
+        {
+            try
+            {
+                string exePath = Path.Combine(baseDirectory, "Darwin2DicomMwlManual.exe");
+                if (!File.Exists(exePath)) throw new FileNotFoundException("找不到 Darwin2DicomMwlManual.exe", exePath);
+                var arguments = new List<string> { "--query", "--tag", tag };
+                if (!string.IsNullOrWhiteSpace(patientId)) { arguments.Add("--value"); arguments.Add(patientId); }
+                var psi = new ProcessStartInfo(exePath, string.Join(" ", arguments.Select(QuoteArgument))) { WorkingDirectory = baseDirectory, UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true };
+                using (var process = Process.Start(psi))
+                {
+                    string output = process.StandardOutput.ReadToEnd();
+                    string error = process.StandardError.ReadToEnd();
+                    process.WaitForExit();
+                    string text = string.IsNullOrWhiteSpace(output) ? error : output;
+                    SearchResultForm.Display(this, text, patientId.Length == 0 ? "Worklist 更新結果" : "搜尋結果");
+                }
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(ex.Message, "Worklist 查詢失敗", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        private static string QuoteArgument(string value)
+        {
+            return "\"" + (value ?? string.Empty).Replace("\"", "\\\"") + "\"";
+        }
+
+        private static void OpenDirectory(string directory)
+        {
+            Directory.CreateDirectory(directory);
+            Process.Start(new ProcessStartInfo("explorer.exe", "\"" + directory + "\"") { UseShellExecute = true });
+        }
+
+        private static void RunPowerShellScript(string scriptPath, bool hidden)
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = "powershell.exe",
+                Arguments = "-NoProfile -ExecutionPolicy Bypass -File \"" + scriptPath + "\"",
+                WorkingDirectory = Path.GetDirectoryName(scriptPath),
+                UseShellExecute = false,
+                CreateNoWindow = hidden,
+                WindowStyle = hidden ? ProcessWindowStyle.Hidden : ProcessWindowStyle.Normal
+            };
+            Process.Start(psi);
+        }
+    }
+
+    internal sealed class LicenseForm : Form
+    {
+        private readonly TextBox activationBox;
+        private readonly Label resultLabel;
+
+        public LicenseForm()
+        {
+            Text = "Darwin2 Worklist 授權解鎖";
+            StartPosition = FormStartPosition.CenterParent;
+            ClientSize = new Size(500, 280);
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = false;
+            MinimizeBox = false;
+            Font = new Font("Microsoft JhengHei UI", 10F);
+
+            var machineLabel = new Label { Text = "機器碼", Location = new Point(24,24), AutoSize = true };
+            var machineBox = new TextBox { Location = new Point(24,48), Width = 440, ReadOnly = true };
+            try { machineBox.Text = TrialManager.GetMachineCode(); } catch (Exception ex) { machineBox.Text = "ERROR: " + ex.Message; }
+            var codeLabel = new Label { Text = "啟動碼", Location = new Point(24,86), AutoSize = true };
+            activationBox = new TextBox { Location = new Point(24,110), Width = 440 };
+            var unlock = new Button { Text = "解鎖", Location = new Point(24,152), Size = new Size(120,34) };
+            var close = new Button { Text = "關閉", Location = new Point(344,152), Size = new Size(120,34) };
+            resultLabel = new Label { Text = "", Location = new Point(24,205), Width = 440, Height = 45 };
+            unlock.Click += Unlock_Click;
+            close.Click += (s,e) => Close();
+            Controls.AddRange(new Control[] { machineLabel, machineBox, codeLabel, activationBox, unlock, close, resultLabel });
+        }
+
+        private void Unlock_Click(object sender, EventArgs e)
+        {
+            try { TrialManager.InstallLicense(activationBox.Text); resultLabel.Text = "授權成功。"; resultLabel.ForeColor = Color.Green; }
+            catch (Exception ex) { resultLabel.Text = ex.Message; resultLabel.ForeColor = Color.Firebrick; }
+        }
+    }
