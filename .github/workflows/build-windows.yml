@@ -1,0 +1,144 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'buildsrc/build_lite.zip'
+      - 'Build-EXE-Select-Icon.bat'
+      - '.github/workflows/build-windows.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build and validate
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path work,out | Out-Null
+          Expand-Archive -LiteralPath buildsrc/build_lite.zip -DestinationPath work -Force
+
+          Invoke-WebRequest -Uri 'https://www.nuget.org/api/v2/package/fo-dicom.Desktop/4.0.8' -OutFile fo-dicom.zip
+          Expand-Archive -LiteralPath fo-dicom.zip -DestinationPath fo-dicom -Force
+          $dicom = Get-ChildItem -Path fo-dicom -Recurse -Filter Dicom.Core.dll | Where-Object { $_.FullName -match 'net45' } | Select-Object -First 1
+          if (-not $dicom) { throw 'Dicom.Core.dll net45 was not found.' }
+          Copy-Item -LiteralPath $dicom.FullName -Destination out\Dicom.Core.dll
+
+          $compilerCandidates = @(
+            'C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe',
+            'C:\Windows\Microsoft.NET\Framework\v4.0.30319\csc.exe'
+          )
+          $compiler = $compilerCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+          if (-not $compiler) { throw '.NET Framework C# compiler was not found.' }
+
+          & $compiler `
+            /nologo `
+            /target:winexe `
+            /optimize+ `
+            /platform:anycpu `
+            /out:out\Darwin2WorklistBridge.exe `
+            /win32icon:work\assets\Darwin2WorklistBridge.ico `
+            /win32manifest:work\src\Darwin2WorklistBridge.manifest `
+            /reference:System.dll `
+            /reference:System.Core.dll `
+            /reference:System.Drawing.dll `
+            /reference:System.Management.dll `
+            /reference:System.Security.dll `
+            /reference:System.Web.Extensions.dll `
+            /reference:System.Windows.Forms.dll `
+            /reference:out\Dicom.Core.dll `
+            work\src\Darwin2WorklistBridgeApp.cs `
+            work\src\DicomTagSynchronization.cs `
+            work\src\DicomTagSyncForm.cs `
+            work\src\FeatureLicense.cs `
+            work\src\PacsReports.cs
+          if ($LASTEXITCODE -ne 0) { throw "C# compiler failed: $LASTEXITCODE" }
+
+          $fileVersion = (Get-Item out\Darwin2WorklistBridge.exe).VersionInfo.FileVersion
+          if ($fileVersion -notlike '1.4.2*') { throw "Unexpected file version: $fileVersion" }
+
+          New-Item -ItemType File -Force -Path out\Start-DarwinWorklistBridge.ps1 | Out-Null
+          New-Item -ItemType File -Force -Path out\Import-DarwinWorklist.ps1 | Out-Null
+          $self = Start-Process -FilePath (Resolve-Path out\Darwin2WorklistBridge.exe) -ArgumentList '--self-test' -WorkingDirectory (Resolve-Path out) -Wait -PassThru -WindowStyle Hidden
+          if ($self.ExitCode -ne 0) { throw "EXE self-test failed: $($self.ExitCode)" }
+
+          $layoutSource = @'
+          using System;
+          using System.Collections.Generic;
+          using System.Drawing;
+          using System.IO;
+          using System.Reflection;
+          using System.Windows.Forms;
+          internal static class LayoutSmoke {
+            [STAThread]
+            static int Main() {
+              Application.EnableVisualStyles();
+              string root = Environment.CurrentDirectory;
+              Assembly asm = Assembly.LoadFrom(Path.Combine(root, "Darwin2WorklistBridge.exe"));
+              Type t = asm.GetType("Darwin2WorklistBridge.MainForm", true);
+              float[] scales = { 1.0f, 1.25f, 1.5f };
+              foreach (float scale in scales) {
+                using (Form form = (Form)Activator.CreateInstance(t, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic, null, new object[] { root }, null)) {
+                  form.AutoScaleMode = AutoScaleMode.None;
+                  form.Scale(new SizeF(scale, scale));
+                  form.ClientSize = new Size((int)(820 * scale), (int)(590 * scale));
+                  form.PerformLayout();
+                  foreach (Button b in Buttons(form)) {
+                    if (!b.Visible) continue;
+                    Rectangle r = b.Bounds;
+                    Rectangle p = b.Parent.ClientRectangle;
+                    if (r.Left < 0 || r.Top < 0 || r.Right > p.Right || r.Bottom > p.Bottom || r.Width < 20 || r.Height < 20) {
+                      Console.Error.WriteLine("Clipped button at scale " + scale + ": " + b.Text);
+                      return 10;
+                    }
+                  }
+                }
+              }
+              return 0;
+            }
+            static IEnumerable<Button> Buttons(Control c) {
+              foreach (Control child in c.Controls) {
+                Button b = child as Button;
+                if (b != null) yield return b;
+                foreach (Button nested in Buttons(child)) yield return nested;
+              }
+            }
+          }
+          '@
+          [IO.File]::WriteAllText((Join-Path $PWD 'LayoutSmoke.cs'), $layoutSource, (New-Object Text.UTF8Encoding($false)))
+          & $compiler /nologo /target:exe /out:out\LayoutSmoke.exe /reference:System.dll /reference:System.Core.dll /reference:System.Drawing.dll /reference:System.Windows.Forms.dll LayoutSmoke.cs
+          if ($LASTEXITCODE -ne 0) { throw "Layout smoke compiler failed: $LASTEXITCODE" }
+          Push-Location out
+          try {
+            .\LayoutSmoke.exe
+            if ($LASTEXITCODE -ne 0) { throw "Layout smoke test failed: $LASTEXITCODE" }
+          } finally { Pop-Location }
+
+          Copy-Item -LiteralPath work\assets\Darwin2WorklistBridge.ico -Destination out\Darwin2WorklistBridge.ico
+          $bat = Get-Content -LiteralPath Build-EXE-Select-Icon.bat -Raw
+          if (($bat.ToCharArray() | Where-Object { [int]$_ -gt 127 }).Count -ne 0) { throw 'BAT contains non-ASCII characters.' }
+          $bat = $bat -replace "`r?`n", "`r`n"
+          [IO.File]::WriteAllText((Join-Path $PWD 'out\Build-EXE-Select-Icon.bat'), $bat, [Text.Encoding]::ASCII)
+          $batBytes = [IO.File]::ReadAllBytes((Join-Path $PWD 'out\Build-EXE-Select-Icon.bat'))
+          for ($i = 0; $i -lt $batBytes.Length; $i++) {
+            if ($batBytes[$i] -eq 10 -and ($i -eq 0 -or $batBytes[$i-1] -ne 13)) { throw 'BAT contains LF without CR.' }
+          }
+
+          Remove-Item out\LayoutSmoke.exe -Force
+          [IO.File]::WriteAllText((Join-Path $PWD 'out\VERSION.txt'), "Darwin2 Worklist Bridge 1.4.2`r`nWindows build validated at 100%, 125%, 150% layout scale.`r`n", (New-Object Text.UTF8Encoding($true)))
+          Compress-Archive -Path out\* -DestinationPath Darwin2WorklistBridge-1.4.2-Windows.zip -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Darwin2WorklistBridge-1.4.2-Windows
+          path: Darwin2WorklistBridge-1.4.2-Windows.zip
+          if-no-files-found: error
